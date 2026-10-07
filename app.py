@@ -28,6 +28,7 @@ import html as html_module
 import hashlib
 import sqlite3
 import random
+import threading
 import unicodedata
 import copy as _copy
 import email
@@ -70,14 +71,10 @@ except Exception:
 # ========================
 APP_NAME                = "AI Netnography Tool"
 OUTPUT_LANGUAGE         = "Deutsch"
-DEFAULT_DEPLOYMENT_NAME = "gpt-6-luna"
-DEFAULT_API_VERSION     = "2025-04-01-preview"   # Azure: reasoning_effort / max_completion_tokens
-# GPT-6 ist ein Reasoning-Modell. "none" = kein Reasoning, dann ist temperature
-# erlaubt (temperature=0 hält die Kodierung reproduzierbar). Bei low/medium/high/
-# xhigh/max wird temperature NICHT gesendet und das Token-Budget aufgestockt.
-DEFAULT_REASONING_EFFORT = "none"
+DEFAULT_DEPLOYMENT_NAME = "gpt-6-luna"      # Endpoint/Deployment/API-Version kommen aus der Secret-Datei
+DEFAULT_API_VERSION     = "v1"              # Azure v1-API (/openai/v1/chat/completions)
+DEFAULT_REASONING_EFFORT = "low"   # Reasoning-Modelle: none | low | medium | high | xhigh | max
 REASONING_EFFORTS        = ["none", "low", "medium", "high", "xhigh", "max"]
-REASONING_TOKEN_HEADROOM = 8000    # Zusatzbudget für Reasoning-Tokens (zählen in max_completion_tokens)
 # Preise in USD pro 1M Tokens (input, output); unbekannte Modelle -> alte Staffel
 MODEL_PRICES_USD = {
     "gpt-6-luna":   (0.10, 0.50),
@@ -667,28 +664,24 @@ def model_price(deployment: str) -> Optional[Tuple[float, float]]:
     return None
 
 
-def estimate_cost_eur(deployment: str, prompt_tokens: int, completion_tokens: int) -> float:
-    price = model_price(deployment)
+def estimate_cost_eur(cfg: dict, prompt_tokens: int, completion_tokens: int) -> float:
+    """Kosten: Preise aus der Secret-Datei (OPENAI_PRICE_*_PER_1M, wie im Coding Tool),
+    sonst Listenpreis des Modells, sonst die bisherige Staffel."""
+    try:
+        p_in, p_out = float(cfg.get("price_in")), float(cfg.get("price_out"))
+        return (prompt_tokens * p_in + completion_tokens * p_out) / 1_000_000
+    except (TypeError, ValueError):
+        pass
+    price = model_price(cfg.get("deployment"))
     if price is None:
         total = int(prompt_tokens) + int(completion_tokens)
         return float(total) * get_cost_per_token(total)
     return (prompt_tokens * price[0] + completion_tokens * price[1]) / 1_000_000 * USD_TO_EUR
 
 
-def is_reasoning_model(cfg: dict) -> bool:
-    """GPT-5/6 und o-Serie brauchen max_completion_tokens + reasoning_effort.
-    Azure-Deployments haben freie Namen -> per OPENAI_REASONING_API=1/0 erzwingbar."""
-    forced = safe_str(cfg.get("reasoning_api")).lower()
-    if forced in ("1", "true", "yes"):
-        return True
-    if forced in ("0", "false", "no"):
-        return False
-    d = safe_str(cfg.get("deployment")).lower()
-    return bool(re.search(r"gpt-?[56]|luna|^o[134]", d))
-
-
 def resolve_llm_cfg() -> dict:
-    """Konfiguration EINMAL im Main-Thread auflösen (Worker dürfen nicht auf st.* zugreifen)."""
+    """Konfiguration EINMAL im Main-Thread auflösen (Worker dürfen nicht auf st.* zugreifen).
+    Gleiche Secret-Namen wie Coding Tool und Transcript Extractor."""
     return {
         "api_key": find_secret(["OPENAI_API_KEY", "AZURE_OPENAI_KEY", "OPENAI_KEY"]),
         "endpoint": find_secret(["OPENAI_ENDPOINT", "AZURE_OPENAI_ENDPOINT"]),
@@ -696,46 +689,109 @@ def resolve_llm_cfg() -> dict:
                        or st.session_state.get("OPENAI_DEPLOYMENT") or DEFAULT_DEPLOYMENT_NAME),
         "api_version": (find_secret(["AZURE_OPENAI_API_VERSION", "OPENAI_API_VERSION"])
                         or st.session_state.get("OPENAI_API_VERSION") or DEFAULT_API_VERSION),
-        "reasoning_effort": (find_secret(["OPENAI_REASONING_EFFORT", "REASONING_EFFORT"])
-                             or st.session_state.get("OPENAI_REASONING_EFFORT")
+        # Reasoning-Modelle (GPT-5/GPT-6 Luna/Sol, o-Serie): »true«/»false«; leer = automatisch
+        # (Deployment-Name, sonst Umstellung beim ersten 400-Fehler).
+        "reasoning": find_secret(["OPENAI_REASONING_MODEL", "AZURE_OPENAI_REASONING_MODEL"]),
+        "reasoning_effort": (st.session_state.get("OPENAI_REASONING_EFFORT")
+                             or find_secret(["OPENAI_REASONING_EFFORT", "AZURE_OPENAI_REASONING_EFFORT"])
                              or DEFAULT_REASONING_EFFORT),
-        "reasoning_api": find_secret(["OPENAI_REASONING_API"]),
+        # optional: Preise je 1 Mio. Tokens für die Kostenanzeige
+        "price_in": find_secret(["OPENAI_PRICE_INPUT_PER_1M"]),
+        "price_out": find_secret(["OPENAI_PRICE_OUTPUT_PER_1M"]),
     }
 
 
-# Parameter, die ein Deployment per HTTP 400 abgelehnt hat — einmal lernen,
-# danach bei jedem Call direkt korrigiert senden (spart pro Call einen Fehlversuch).
-_PARAM_FIXES: Dict[str, set] = {}
+_REASONING_NAME_HINTS = ("gpt-5", "gpt5", "gpt-6", "gpt6", "luna", "sol", "astra", "o1", "o3", "o4")
+_LEARNED_MODE: dict = {}          # Deployment → True (Reasoning-Parameter) / False, aus 400-Antworten gelernt
+_LEARNED_LOCK = threading.Lock()
 
 
-def _apply_param_fixes(payload: dict, fixes: set) -> dict:
-    p = dict(payload)
-    if "use_max_completion_tokens" in fixes and "max_tokens" in p:
-        p["max_completion_tokens"] = p.pop("max_tokens")
-    if "use_max_tokens" in fixes and "max_completion_tokens" in p:
-        p["max_tokens"] = p.pop("max_completion_tokens")
-    if "drop_temperature" in fixes:
-        p.pop("temperature", None)
-    if "drop_reasoning_effort" in fixes and p.pop("reasoning_effort", None) is not None:
-        # Ohne explizites "none" denkt das Modell mit seinem Default -> Budget aufstocken
-        for k in ("max_completion_tokens", "max_tokens"):
-            if k in p:
-                p[k] = int(p[k]) + REASONING_TOKEN_HEADROOM
-    return p
+def is_reasoning_model(cfg: dict) -> bool:
+    """Reasoning-Modell? Reihenfolge: ausdrückliche Einstellung › gelernt › Deployment-Name.
+    Azure-Deployments können beliebig heißen (»luna-prod«) – deshalb zusätzlich das Lernen."""
+    flag = safe_str(cfg.get("reasoning")).lower()
+    if flag in ("true", "1", "yes", "ja"):
+        return True
+    if flag in ("false", "0", "no", "nein"):
+        return False
+    dep = safe_str(cfg.get("deployment")).lower()
+    with _LEARNED_LOCK:
+        if dep in _LEARNED_MODE:
+            return _LEARNED_MODE[dep]
+    return any(h in re.split(r"[^a-z0-9.]+", dep) or dep.startswith(h) for h in _REASONING_NAME_HINTS)
 
 
-def _param_fix_for_400(body: str, payload: dict) -> Optional[str]:
-    """Erkennt Parameter-Ablehnungen (gpt-6 vs. ältere Modelle / Azure-API-Versionen)."""
-    b = safe_str(body).lower()
-    if "max_tokens" in b and "max_completion_tokens" in b and "max_tokens" in payload:
-        return "use_max_completion_tokens"
-    if "max_completion_tokens" in b and "max_completion_tokens" in payload:
-        return "use_max_tokens"
-    if "temperature" in b and "temperature" in payload:
-        return "drop_temperature"
-    if "reasoning_effort" in b and "reasoning_effort" in payload:
-        return "drop_reasoning_effort"
-    return None
+def _reasoning_budget(max_tokens: int, effort: str) -> int:
+    """Reasoning-Tokens zählen in max_completion_tokens mit. Ohne Aufschlag bleibt bei hohem
+    Aufwand nichts für die eigentliche Antwort übrig (leere, abgeschnittene JSONs)."""
+    extra = {"none": 0, "minimal": 500, "low": 2000, "medium": 6000, "high": 16000,
+             "xhigh": 32000, "max": 48000}.get(safe_str(effort).lower(), 6000)
+    return int(min(max_tokens + extra, 128000))
+
+
+def _llm_request(cfg: dict, messages: list, max_tokens: int, temperature: float,
+                 reasoning: bool, effort: str):
+    """URL, Header und Payload für Azure (klassisch oder v1) bzw. OpenAI direkt."""
+    endpoint = safe_str(cfg.get("endpoint")).rstrip("/")
+    deployment = cfg.get("deployment")
+    api_version = safe_str(cfg.get("api_version"))
+    payload = {"messages": messages}
+    if reasoning:
+        payload["max_completion_tokens"] = _reasoning_budget(max_tokens, effort)
+        if effort:
+            payload["reasoning_effort"] = effort
+        # keine temperature/top_p: von Reasoning-Modellen abgelehnt
+    else:
+        payload["max_tokens"] = max_tokens
+        payload["temperature"] = temperature
+    if endpoint:
+        headers = {"Content-Type": "application/json", "api-key": cfg.get("api_key")}
+        if api_version.lower() in ("v1", "latest", "preview") or endpoint.endswith("/openai/v1"):
+            # Azure v1-API: kein Deployment im Pfad, kein api-version-Parameter, Modell im Body
+            base = endpoint if endpoint.endswith("/openai/v1") else f"{endpoint}/openai/v1"
+            url = f"{base}/chat/completions"
+            payload["model"] = deployment
+        else:
+            url = (f"{endpoint}/openai/deployments/{deployment}/chat/completions"
+                   f"?api-version={api_version}")
+    else:
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {cfg.get('api_key')}"}
+        payload["model"] = deployment
+    return url, headers, payload
+
+
+def _param_rejected(resp) -> str:
+    """Welchen Parameter hat der Server abgelehnt?
+    »classic«   = alte Parameter (max_tokens/temperature/top_p) → Reasoning-Modell
+    »reasoning« = neue Parameter (max_completion_tokens) unbekannt → klassisches Modell
+    »effort«    = nur reasoning_effort unbekannt/unzulässig
+    Erst das strukturierte Feld »param«, dann der Meldungstext mit exakten Mustern – die
+    typische Meldung nennt BEIDE Namen (»'max_tokens' is not supported … Use
+    'max_completion_tokens' instead«)."""
+    try:
+        err = (resp.json() or {}).get("error") or {}
+    except Exception:
+        err = {}
+    param = safe_str(err.get("param")).lower()
+    if param in ("max_tokens", "temperature", "top_p"):
+        return "classic"
+    if param == "max_completion_tokens":
+        return "reasoning"
+    if param == "reasoning_effort":
+        return "effort"
+    msg = (safe_str(err.get("message")) or safe_str(getattr(resp, "text", ""))).lower()
+    bad = r"(?:is not supported|not supported with this model|unsupported (?:parameter|value)|" \
+          r"does not support|only the default)"
+    if re.search(r"['\"]?(max_tokens|temperature|top_p)['\"]?[^.]{0,40}" + bad, msg) or \
+            re.search(r"unsupported (?:parameter|value)[^.]{0,20}['\"]?(max_tokens|temperature|top_p)", msg):
+        return "classic"
+    if re.search(r"(unrecognized request argument|unknown parameter)[^.]{0,30}max_completion_tokens", msg) \
+            or re.search(r"['\"]?max_completion_tokens['\"]?[^.]{0,40}" + bad, msg):
+        return "reasoning"
+    if "reasoning_effort" in msg:
+        return "effort"
+    return ""
 
 
 def call_llm(prompt: str, system_prompt: str, max_tokens: int = 1400,
@@ -743,62 +799,48 @@ def call_llm(prompt: str, system_prompt: str, max_tokens: int = 1400,
              max_retries: int = 3) -> Tuple[str, int, float, str]:
     """Gibt (text, tokens, kosten, finish_reason) zurück.
     finish_reason == 'length' bedeutet: Antwort ist ABGESCHNITTEN und darf nicht
-    als gültig behandelt werden."""
+    als gültig behandelt werden.
+
+    Gleicher Aufruf wie im Coding Tool:
+    Klassische Modelle (gpt-4.1 …): max_tokens + temperature.
+    Reasoning-Modelle (GPT-5, GPT-6 Luna/Sol, o-Serie): max_completion_tokens (inkl.
+    Reasoning-Budget) + reasoning_effort, ohne temperature. Lehnt der Server die Parameter
+    ab (400), stellt sich der Aufruf einmal um und merkt sich das je Deployment."""
     cfg = llm_cfg or resolve_llm_cfg()
-    api_key = cfg.get("api_key")
     endpoint = cfg.get("endpoint")
     deployment = cfg.get("deployment")
     api_version = cfg.get("api_version")
 
-    if not api_key:
+    if not cfg.get("api_key"):
         raise Exception("API-Key fehlt (OPENAI_API_KEY / AZURE_OPENAI_KEY).")
 
     messages = [
         {"role": "system", "content": safe_str(system_prompt)},
         {"role": "user", "content": safe_str(prompt)},
     ]
-
-    if is_reasoning_model(cfg):
-        effort = safe_str(cfg.get("reasoning_effort")) or DEFAULT_REASONING_EFFORT
-        payload = {"messages": messages, "reasoning_effort": effort}
-        if effort == "none":
-            # temperature ist nur ohne Reasoning erlaubt
-            payload["temperature"] = temperature
-            payload["max_completion_tokens"] = max_tokens
-        else:
-            # Reasoning-Tokens zählen ins Budget -> ohne Aufschlag droht finish_reason=length
-            payload["max_completion_tokens"] = max_tokens + REASONING_TOKEN_HEADROOM
-    else:
-        payload = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-
-    if endpoint:
-        url = (f"{endpoint.rstrip('/')}/openai/deployments/{deployment}"
-               f"/chat/completions?api-version={api_version}")
-        headers = {"Content-Type": "application/json", "api-key": api_key}
-    else:
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-        payload = {"model": deployment, **payload}
-
-    fix_key = f"{endpoint}|{deployment}"
-    base_payload = payload
-    payload = _apply_param_fixes(base_payload, _PARAM_FIXES.get(fix_key, set()))
+    reasoning = is_reasoning_model(cfg)
+    effort = safe_str(cfg.get("reasoning_effort")) or DEFAULT_REASONING_EFFORT
+    dep_key = safe_str(deployment).lower()
+    switched = budget_raised = False
 
     result, last_err = None, None
-    attempt, param_fixes_left = 0, 4
+    attempt = 0
     while attempt <= max_retries:
+        url, headers, payload = _llm_request(cfg, messages, max_tokens, temperature, reasoning, effort)
         try:
             r = requests.post(url, json=payload, headers=headers, timeout=180)
-            if r.status_code == 400:
-                fix = _param_fix_for_400(r.text, payload) if param_fixes_left > 0 else None
-                if fix:
-                    # Parameter vom Modell abgelehnt -> korrigieren, merken, sofort erneut
-                    param_fixes_left -= 1
-                    _PARAM_FIXES.setdefault(fix_key, set()).add(fix)
-                    payload = _apply_param_fixes(base_payload, _PARAM_FIXES[fix_key])
-                    continue
-                # Nicht retrybar: Prompt-/Content-Fehler. Sofort laut scheitern.
-                raise Exception(f"HTTP 400 (nicht wiederholbar): {r.text[:400]}")
+            if r.status_code == 400 and not switched:
+                kind = _param_rejected(r)
+                if kind == "classic" and not reasoning:
+                    reasoning, switched = True, True
+                elif kind == "reasoning" and reasoning:
+                    reasoning, switched = False, True
+                elif kind == "effort" and reasoning and effort:
+                    effort, switched = "", True
+                if switched:
+                    with _LEARNED_LOCK:
+                        _LEARNED_MODE[dep_key] = reasoning
+                    continue            # sofort mit passenden Parametern, zählt nicht als Versuch
             if r.status_code in (401, 403):
                 raise Exception(f"HTTP {r.status_code}: Authentifizierung fehlgeschlagen.")
             if r.status_code == 429 or r.status_code >= 500:
@@ -806,12 +848,23 @@ def call_llm(prompt: str, system_prompt: str, max_tokens: int = 1400,
                 wait = float(ra) if ra else min(2 ** attempt * 2, 30) + random.uniform(0, 1.5)
                 last_err = Exception(f"HTTP {r.status_code}")
                 if attempt < max_retries:
-                    attempt += 1
                     time.sleep(wait)
+                    attempt += 1
                     continue
                 r.raise_for_status()
-            r.raise_for_status()
+            if r.status_code >= 400:
+                # 4xx (außer 429) ist kein Netzproblem – Wiederholen hilft nicht. Sofort laut scheitern.
+                raise Exception(f"HTTP {r.status_code} (nicht wiederholbar): "
+                                f"{safe_str(getattr(r, 'text', ''))[:400]} | URL={url}")
             result = r.json()
+            # Reasoning hat das Budget verbraucht → leere Antwort: einmal mit doppeltem Budget
+            ch = (result.get("choices") or [{}])[0] if isinstance(result, dict) else {}
+            content = safe_str((ch.get("message") or {}).get("content", ""))
+            if reasoning and not content and ch.get("finish_reason") == "length" and not budget_raised:
+                budget_raised = True
+                max_tokens = max_tokens * 2 + 4000
+                result = None
+                continue
             break
         except requests.exceptions.RequestException as e:
             last_err = e
@@ -823,7 +876,7 @@ def call_llm(prompt: str, system_prompt: str, max_tokens: int = 1400,
 
     if result is None:
         raise Exception(f"LLM-Request fehlgeschlagen nach {max_retries + 1} Versuchen: {last_err} "
-                        f"| Endpoint={endpoint} | Deployment={deployment}")
+                        f"| Endpoint={endpoint} | Deployment={deployment} | API-Version={api_version}")
 
     output_text, finish_reason = "", "unknown"
     if isinstance(result, dict) and result.get("choices"):
@@ -852,7 +905,7 @@ def call_llm(prompt: str, system_prompt: str, max_tokens: int = 1400,
     if prompt_tokens is None or completion_tokens is None:
         prompt_tokens, completion_tokens = int(total_tokens), 0
 
-    cost = estimate_cost_eur(deployment, int(prompt_tokens), int(completion_tokens))
+    cost = estimate_cost_eur(cfg, int(prompt_tokens), int(completion_tokens))
     return safe_str(output_text), int(total_tokens), float(cost), finish_reason
 
 
@@ -4292,16 +4345,16 @@ st.sidebar.markdown(
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Modell")
 _cfg_preview = resolve_llm_cfg()
-st.sidebar.caption(f"Deployment: `{_cfg_preview.get('deployment')}`")
+st.sidebar.caption(f"Deployment: `{_cfg_preview.get('deployment')}` · API-Version: "
+                   f"`{_cfg_preview.get('api_version')}`")
 if is_reasoning_model(_cfg_preview):
     st.sidebar.selectbox(
         "Reasoning-Effort", REASONING_EFFORTS,
         index=REASONING_EFFORTS.index(_cfg_preview.get("reasoning_effort"))
         if _cfg_preview.get("reasoning_effort") in REASONING_EFFORTS else 0,
         key="OPENAI_REASONING_EFFORT",
-        help="'none' = schnell, günstig, temperature=0 (reproduzierbar). "
-             "Höhere Stufen denken mehr nach, kosten mehr Output-Tokens und "
-             "ignorieren temperature.")
+        help="Standard kommt aus der Secret-Datei (OPENAI_REASONING_EFFORT). "
+             "Höhere Stufen denken mehr nach und kosten mehr Output-Tokens.")
     _cfg_preview = resolve_llm_cfg()
 st.sidebar.caption("Endpoint: " + ("gesetzt ✅" if _cfg_preview.get("endpoint") else "OpenAI-Default"))
 st.sidebar.caption("API-Key: " + ("gesetzt ✅" if _cfg_preview.get("api_key") else "FEHLT ❌"))
@@ -4732,10 +4785,9 @@ splits_selected = st.multiselect(
 n_work = stats["n_analysierbar"]
 est_calls = math.ceil(n_work / max(1, batch_size)) + int(rounds) + max_ober + len(fragen)
 _est_in = 2500 + 250 * max(1, batch_size)   # grob: System-Prompt + Kommentare je Call
-_est_out = 1500 + (REASONING_TOKEN_HEADROOM // 2
-                   if is_reasoning_model(_cfg_preview)
-                   and _cfg_preview.get("reasoning_effort") != "none" else 0)
-est_cost = est_calls * estimate_cost_eur(_cfg_preview.get("deployment"), _est_in, _est_out)
+_est_out = (_reasoning_budget(1500, _cfg_preview.get("reasoning_effort")) // 2 + 750
+            if is_reasoning_model(_cfg_preview) else 1500)
+est_cost = est_calls * estimate_cost_eur(_cfg_preview, _est_in, _est_out)
 st.caption(f"Grobschätzung: ~{est_calls} LLM-Calls, ~{est_cost:.2f} € "
            f"(ohne Cache-Treffer; die tatsächlichen Kosten stehen nach dem Lauf im Log).")
 
