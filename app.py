@@ -662,7 +662,7 @@ def get_cost_per_token(num_tokens: int) -> float:
 def model_price(deployment: str) -> Optional[Tuple[float, float]]:
     d = safe_str(deployment).lower()
     for name, price in MODEL_PRICES_USD.items():
-        if d.startswith(name):
+        if name in d or (name == "gpt-6-luna" and "luna" in d):
             return price
     return None
 
@@ -684,7 +684,7 @@ def is_reasoning_model(cfg: dict) -> bool:
     if forced in ("0", "false", "no"):
         return False
     d = safe_str(cfg.get("deployment")).lower()
-    return bool(re.match(r"^(gpt-5|gpt-6|o1|o3|o4)", d))
+    return bool(re.search(r"gpt-?[56]|luna|^o[134]", d))
 
 
 def resolve_llm_cfg() -> dict:
@@ -701,6 +701,41 @@ def resolve_llm_cfg() -> dict:
                              or DEFAULT_REASONING_EFFORT),
         "reasoning_api": find_secret(["OPENAI_REASONING_API"]),
     }
+
+
+# Parameter, die ein Deployment per HTTP 400 abgelehnt hat — einmal lernen,
+# danach bei jedem Call direkt korrigiert senden (spart pro Call einen Fehlversuch).
+_PARAM_FIXES: Dict[str, set] = {}
+
+
+def _apply_param_fixes(payload: dict, fixes: set) -> dict:
+    p = dict(payload)
+    if "use_max_completion_tokens" in fixes and "max_tokens" in p:
+        p["max_completion_tokens"] = p.pop("max_tokens")
+    if "use_max_tokens" in fixes and "max_completion_tokens" in p:
+        p["max_tokens"] = p.pop("max_completion_tokens")
+    if "drop_temperature" in fixes:
+        p.pop("temperature", None)
+    if "drop_reasoning_effort" in fixes and p.pop("reasoning_effort", None) is not None:
+        # Ohne explizites "none" denkt das Modell mit seinem Default -> Budget aufstocken
+        for k in ("max_completion_tokens", "max_tokens"):
+            if k in p:
+                p[k] = int(p[k]) + REASONING_TOKEN_HEADROOM
+    return p
+
+
+def _param_fix_for_400(body: str, payload: dict) -> Optional[str]:
+    """Erkennt Parameter-Ablehnungen (gpt-6 vs. ältere Modelle / Azure-API-Versionen)."""
+    b = safe_str(body).lower()
+    if "max_tokens" in b and "max_completion_tokens" in b and "max_tokens" in payload:
+        return "use_max_completion_tokens"
+    if "max_completion_tokens" in b and "max_completion_tokens" in payload:
+        return "use_max_tokens"
+    if "temperature" in b and "temperature" in payload:
+        return "drop_temperature"
+    if "reasoning_effort" in b and "reasoning_effort" in payload:
+        return "drop_reasoning_effort"
+    return None
 
 
 def call_llm(prompt: str, system_prompt: str, max_tokens: int = 1400,
@@ -745,11 +780,23 @@ def call_llm(prompt: str, system_prompt: str, max_tokens: int = 1400,
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
         payload = {"model": deployment, **payload}
 
+    fix_key = f"{endpoint}|{deployment}"
+    base_payload = payload
+    payload = _apply_param_fixes(base_payload, _PARAM_FIXES.get(fix_key, set()))
+
     result, last_err = None, None
-    for attempt in range(max_retries + 1):
+    attempt, param_fixes_left = 0, 4
+    while attempt <= max_retries:
         try:
             r = requests.post(url, json=payload, headers=headers, timeout=180)
             if r.status_code == 400:
+                fix = _param_fix_for_400(r.text, payload) if param_fixes_left > 0 else None
+                if fix:
+                    # Parameter vom Modell abgelehnt -> korrigieren, merken, sofort erneut
+                    param_fixes_left -= 1
+                    _PARAM_FIXES.setdefault(fix_key, set()).add(fix)
+                    payload = _apply_param_fixes(base_payload, _PARAM_FIXES[fix_key])
+                    continue
                 # Nicht retrybar: Prompt-/Content-Fehler. Sofort laut scheitern.
                 raise Exception(f"HTTP 400 (nicht wiederholbar): {r.text[:400]}")
             if r.status_code in (401, 403):
@@ -759,6 +806,7 @@ def call_llm(prompt: str, system_prompt: str, max_tokens: int = 1400,
                 wait = float(ra) if ra else min(2 ** attempt * 2, 30) + random.uniform(0, 1.5)
                 last_err = Exception(f"HTTP {r.status_code}")
                 if attempt < max_retries:
+                    attempt += 1
                     time.sleep(wait)
                     continue
                 r.raise_for_status()
@@ -769,7 +817,9 @@ def call_llm(prompt: str, system_prompt: str, max_tokens: int = 1400,
             last_err = e
             if attempt < max_retries:
                 time.sleep(min(2 ** attempt * 2, 30) + random.uniform(0, 1.5))
+                attempt += 1
                 continue
+            break
 
     if result is None:
         raise Exception(f"LLM-Request fehlgeschlagen nach {max_retries + 1} Versuchen: {last_err} "
