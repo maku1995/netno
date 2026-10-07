@@ -70,8 +70,20 @@ except Exception:
 # ========================
 APP_NAME                = "AI Netnography Tool"
 OUTPUT_LANGUAGE         = "Deutsch"
-DEFAULT_DEPLOYMENT_NAME = "gpt-4.1-mini"
-DEFAULT_API_VERSION     = "2024-02-01"
+DEFAULT_DEPLOYMENT_NAME = "gpt-6-luna"
+DEFAULT_API_VERSION     = "2025-04-01-preview"   # Azure: reasoning_effort / max_completion_tokens
+# GPT-6 ist ein Reasoning-Modell. "none" = kein Reasoning, dann ist temperature
+# erlaubt (temperature=0 hält die Kodierung reproduzierbar). Bei low/medium/high/
+# xhigh/max wird temperature NICHT gesendet und das Token-Budget aufgestockt.
+DEFAULT_REASONING_EFFORT = "none"
+REASONING_EFFORTS        = ["none", "low", "medium", "high", "xhigh", "max"]
+REASONING_TOKEN_HEADROOM = 8000    # Zusatzbudget für Reasoning-Tokens (zählen in max_completion_tokens)
+# Preise in USD pro 1M Tokens (input, output); unbekannte Modelle -> alte Staffel
+MODEL_PRICES_USD = {
+    "gpt-6-luna":   (0.10, 0.50),
+    "gpt-4.1-mini": (0.40, 1.60),
+}
+USD_TO_EUR               = 0.86    # grobe Umrechnung für die Kostenanzeige
 
 MIN_COMMENT_CHARS       = 15      # kürzere Fragmente = Navigationsreste
 MAX_COMMENT_CHARS       = 12000   # längere Blöcke = vermutlich ganze Seite
@@ -647,6 +659,34 @@ def get_cost_per_token(num_tokens: int) -> float:
     return 0.00228 / 2000
 
 
+def model_price(deployment: str) -> Optional[Tuple[float, float]]:
+    d = safe_str(deployment).lower()
+    for name, price in MODEL_PRICES_USD.items():
+        if d.startswith(name):
+            return price
+    return None
+
+
+def estimate_cost_eur(deployment: str, prompt_tokens: int, completion_tokens: int) -> float:
+    price = model_price(deployment)
+    if price is None:
+        total = int(prompt_tokens) + int(completion_tokens)
+        return float(total) * get_cost_per_token(total)
+    return (prompt_tokens * price[0] + completion_tokens * price[1]) / 1_000_000 * USD_TO_EUR
+
+
+def is_reasoning_model(cfg: dict) -> bool:
+    """GPT-5/6 und o-Serie brauchen max_completion_tokens + reasoning_effort.
+    Azure-Deployments haben freie Namen -> per OPENAI_REASONING_API=1/0 erzwingbar."""
+    forced = safe_str(cfg.get("reasoning_api")).lower()
+    if forced in ("1", "true", "yes"):
+        return True
+    if forced in ("0", "false", "no"):
+        return False
+    d = safe_str(cfg.get("deployment")).lower()
+    return bool(re.match(r"^(gpt-5|gpt-6|o1|o3|o4)", d))
+
+
 def resolve_llm_cfg() -> dict:
     """Konfiguration EINMAL im Main-Thread auflösen (Worker dürfen nicht auf st.* zugreifen)."""
     return {
@@ -656,6 +696,10 @@ def resolve_llm_cfg() -> dict:
                        or st.session_state.get("OPENAI_DEPLOYMENT") or DEFAULT_DEPLOYMENT_NAME),
         "api_version": (find_secret(["AZURE_OPENAI_API_VERSION", "OPENAI_API_VERSION"])
                         or st.session_state.get("OPENAI_API_VERSION") or DEFAULT_API_VERSION),
+        "reasoning_effort": (find_secret(["OPENAI_REASONING_EFFORT", "REASONING_EFFORT"])
+                             or st.session_state.get("OPENAI_REASONING_EFFORT")
+                             or DEFAULT_REASONING_EFFORT),
+        "reasoning_api": find_secret(["OPENAI_REASONING_API"]),
     }
 
 
@@ -679,16 +723,27 @@ def call_llm(prompt: str, system_prompt: str, max_tokens: int = 1400,
         {"role": "user", "content": safe_str(prompt)},
     ]
 
+    if is_reasoning_model(cfg):
+        effort = safe_str(cfg.get("reasoning_effort")) or DEFAULT_REASONING_EFFORT
+        payload = {"messages": messages, "reasoning_effort": effort}
+        if effort == "none":
+            # temperature ist nur ohne Reasoning erlaubt
+            payload["temperature"] = temperature
+            payload["max_completion_tokens"] = max_tokens
+        else:
+            # Reasoning-Tokens zählen ins Budget -> ohne Aufschlag droht finish_reason=length
+            payload["max_completion_tokens"] = max_tokens + REASONING_TOKEN_HEADROOM
+    else:
+        payload = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+
     if endpoint:
         url = (f"{endpoint.rstrip('/')}/openai/deployments/{deployment}"
                f"/chat/completions?api-version={api_version}")
         headers = {"Content-Type": "application/json", "api-key": api_key}
-        payload = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
     else:
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-        payload = {"model": deployment, "messages": messages,
-                   "temperature": temperature, "max_tokens": max_tokens}
+        payload = {"model": deployment, **payload}
 
     result, last_err = None, None
     for attempt in range(max_retries + 1):
@@ -734,14 +789,20 @@ def call_llm(prompt: str, system_prompt: str, max_tokens: int = 1400,
     else:
         output_text = json.dumps(result, ensure_ascii=False)
 
-    total_tokens = None
+    total_tokens, prompt_tokens, completion_tokens = None, None, None
     if isinstance(result, dict) and isinstance(result.get("usage"), dict):
-        total_tokens = result["usage"].get("total_tokens")
+        usage = result["usage"]
+        total_tokens = usage.get("total_tokens")
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")   # inkl. Reasoning-Tokens
     if total_tokens is None:
-        total_tokens = (len(safe_str(system_prompt).split()) + len(safe_str(prompt).split())
-                        + len(safe_str(output_text).split()))
+        prompt_tokens = len(safe_str(system_prompt).split()) + len(safe_str(prompt).split())
+        completion_tokens = len(safe_str(output_text).split())
+        total_tokens = prompt_tokens + completion_tokens
+    if prompt_tokens is None or completion_tokens is None:
+        prompt_tokens, completion_tokens = int(total_tokens), 0
 
-    cost = float(total_tokens) * get_cost_per_token(int(total_tokens))
+    cost = estimate_cost_eur(deployment, int(prompt_tokens), int(completion_tokens))
     return safe_str(output_text), int(total_tokens), float(cost), finish_reason
 
 
@@ -754,8 +815,8 @@ def call_llm_cached(prompt: str, system_prompt: str, max_tokens: int = 1400,
     Antworten werden NIE gecacht — sonst friert ein Fehler dauerhaft ein.
     Rückgabe: (text, tokens, cost, finish_reason, was_cached)"""
     cfg = llm_cfg or resolve_llm_cfg()
-    key = sha1("|".join([safe_str(cfg.get("deployment")), str(temperature), str(max_tokens),
-                         system_prompt, prompt]))
+    key = sha1("|".join([safe_str(cfg.get("deployment")), safe_str(cfg.get("reasoning_effort")),
+                         str(temperature), str(max_tokens), system_prompt, prompt]))
     if use_cache:
         hit = cache_get(key)
         if hit:
@@ -4182,6 +4243,16 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("### Modell")
 _cfg_preview = resolve_llm_cfg()
 st.sidebar.caption(f"Deployment: `{_cfg_preview.get('deployment')}`")
+if is_reasoning_model(_cfg_preview):
+    st.sidebar.selectbox(
+        "Reasoning-Effort", REASONING_EFFORTS,
+        index=REASONING_EFFORTS.index(_cfg_preview.get("reasoning_effort"))
+        if _cfg_preview.get("reasoning_effort") in REASONING_EFFORTS else 0,
+        key="OPENAI_REASONING_EFFORT",
+        help="'none' = schnell, günstig, temperature=0 (reproduzierbar). "
+             "Höhere Stufen denken mehr nach, kosten mehr Output-Tokens und "
+             "ignorieren temperature.")
+    _cfg_preview = resolve_llm_cfg()
 st.sidebar.caption("Endpoint: " + ("gesetzt ✅" if _cfg_preview.get("endpoint") else "OpenAI-Default"))
 st.sidebar.caption("API-Key: " + ("gesetzt ✅" if _cfg_preview.get("api_key") else "FEHLT ❌"))
 
@@ -4610,7 +4681,11 @@ splits_selected = st.multiselect(
 # Kostenschätzung vor dem Lauf — keine Überraschungen
 n_work = stats["n_analysierbar"]
 est_calls = math.ceil(n_work / max(1, batch_size)) + int(rounds) + max_ober + len(fragen)
-est_cost = est_calls * 0.0025 * (batch_size / 10 + 1)
+_est_in = 2500 + 250 * max(1, batch_size)   # grob: System-Prompt + Kommentare je Call
+_est_out = 1500 + (REASONING_TOKEN_HEADROOM // 2
+                   if is_reasoning_model(_cfg_preview)
+                   and _cfg_preview.get("reasoning_effort") != "none" else 0)
+est_cost = est_calls * estimate_cost_eur(_cfg_preview.get("deployment"), _est_in, _est_out)
 st.caption(f"Grobschätzung: ~{est_calls} LLM-Calls, ~{est_cost:.2f} € "
            f"(ohne Cache-Treffer; die tatsächlichen Kosten stehen nach dem Lauf im Log).")
 
@@ -4716,7 +4791,8 @@ if st.button("🚀 Analyse starten", type="primary", disabled=(n_work == 0)):
         "meta": {"projekt": p_name or p_id, "user": p_user, "modus": modus,
                  "erhebung": beschreibe_erhebung(SS.get("file_results", [])),
                  "n_unkodiert": int((coded["status"] == "PARSE_ERROR").sum()) if len(coded) else 0,
-                 "modell": cfg.get("deployment"), "kontext": kontext_txt, "fragen": fragen},
+                 "modell": (f'{cfg.get("deployment")} (reasoning_effort={cfg.get("reasoning_effort")})'
+                            if is_reasoning_model(cfg) else cfg.get("deployment")), "kontext": kontext_txt, "fragen": fragen},
     }
     st.rerun()
 
